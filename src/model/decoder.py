@@ -5,6 +5,8 @@ import torch.nn as nn
 from einops import rearrange
 from unsloth import FastLanguageModel
 
+from .layers import SwiGLUTransformerLayer
+
 
 class TextDecoder(nn.Module):
     """Text decoder using pretrained Qwen3 with learned upsampling.
@@ -13,10 +15,19 @@ class TextDecoder(nn.Module):
     and outputs logits over vocabulary (decoded into tokens).
 
     Steps:
-    - Compressed latent sequence
-    - Upsampled to longer token sequence
-    - Pass through Qwen3
-    - Output logits over vocab
+    1. Input compressed latents:
+        (batch, compressed_len, latent_dim)
+    2. Refine latents with self-attention:
+        (batch, compressed_len, latent_dim)
+    3. Linear projection to hidden size:
+        (batch, compressed_len, hidden_size)
+    4. Upsample via transposed convolutions:
+        (batch, compressed_len * compression_factor, hidden_size)
+       - Each layer 2x expands sequence length
+    5. Process through Qwen3 backbone (one-shot, not autoregressive):
+        (batch, seq_len, hidden_size)
+    6. Linear projection to vocabulary logits:
+        (batch, seq_len, vocab_size)
     """
 
     def __init__(
@@ -71,29 +82,27 @@ class TextDecoder(nn.Module):
         return result
 
     def _create_latent_refinement(self, num_layers: int) -> nn.ModuleList:
-        """Create self-attention layers for latent refinement.
+        """Create self-attention layers for latent refinement with SwiGLU FFN.
 
         Args:
             num_layers: Number of transformer layers (0 to disable)
 
         Returns:
-            ModuleList of transformer encoder layers
+            ModuleList of custom transformer layers with SwiGLU
         """
         if num_layers == 0:
             return nn.ModuleList()
 
-        layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.latent_dim,
-                nhead=8,
-                dim_feedforward=self.latent_dim * 4,
-                dropout=0.1,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            )
-            for _ in range(num_layers)
-        ])
+        layers = nn.ModuleList(
+            [
+                SwiGLUTransformerLayer(
+                    d_model=self.latent_dim,
+                    nhead=8,
+                    dropout=0.1,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         return layers
 
     def _refine_latents(self, latent: torch.Tensor) -> torch.Tensor:

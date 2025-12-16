@@ -5,12 +5,30 @@ import torch.nn as nn
 from unsloth import FastLanguageModel
 from einops import rearrange
 
+from .layers import SwiGLUTransformerLayer
+
 
 class TextEncoder(nn.Module):
     """Text encoder using pretrained Qwen3 with learned downsampling.
 
     Takes token embeddings, processes through Qwen3, then downsamples
     to create compressed latent representations.
+
+    Steps:
+    1. Input token IDs: (batch, seq_len)
+    2. Process through Qwen3 backbone: (batch, seq_len, hidden_size)
+       - Full transformer processing for contextualization
+       - Extract last hidden state
+    3. Downsample via strided convolutions: (batch, seq_len // compression_factor, hidden_size)
+       - Each layer 2x reduces sequence length
+       - compression_factor=4 means 2 downsample layers
+    4. Project to latent dimension: (batch, compressed_len, latent_dim)
+       - Maps from hidden_size to latent_dim
+    5. Refine latents with self-attention: (batch, compressed_len, latent_dim)
+       - num_latent_layers transformer layers operate on compressed sequence
+       - Allows latents to communicate after compression
+    6. Output compressed latents: (batch, compressed_len, latent_dim)
+       - Ready for RQ-VAE quantization
     """
 
     def __init__(
@@ -83,26 +101,22 @@ class TextEncoder(nn.Module):
         return result
 
     def _create_latent_refinement(self, num_layers: int) -> nn.ModuleList:
-        """Create self-attention layers for latent refinement.
+        """Create self-attention layers for latent refinement with SwiGLU FFN.
 
         Args:
             num_layers: Number of transformer layers (0 to disable)
 
         Returns:
-            ModuleList of transformer encoder layers
+            ModuleList of custom transformer layers with SwiGLU
         """
         if num_layers == 0:
             return nn.ModuleList()
 
         layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
+            SwiGLUTransformerLayer(
                 d_model=self.latent_dim,
                 nhead=8,
-                dim_feedforward=self.latent_dim * 4,
                 dropout=0.1,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
             )
             for _ in range(num_layers)
         ])
