@@ -1,0 +1,40 @@
+# Phase 1: Full RQ-VAE training
+# Target: ~12-24 hours on A100, ~$50
+
+# Model config
+model:
+  model_name: "Qwen/Qwen3-0.6B"
+  latent_dim: 512
+  compression_factor: 8  # 256 tokens -> 32 latents
+  codebook_size: 512
+  num_quantizers: 8  # K^D = 512^8 capacity
+  commitment_weight: 0.25
+
+# Data config
+data:
+  dataset: "openwebtext"
+  max_length: 256
+  num_samples: 500000  # ~100M tokens
+  batch_size: 32
+  num_workers: 4
+  text_column: "text"
+
+# Training config
+training:
+  lr: 1e-4
+  weight_decay: 0.01
+  num_epochs: 10
+  warmup_epochs: 2
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+# Logging
+logging:
+  wandb_project: "rq-vae-text"
+  wandb_run_name: "phase1-full-vae"
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
+
+# Output
+output_dir: "./checkpoints/phase1"

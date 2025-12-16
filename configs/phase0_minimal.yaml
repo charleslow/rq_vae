@@ -1,0 +1,40 @@
+# Phase 0: Minimal experiment to validate RQ-VAE reconstruction
+# Target: ~2-4 hours on A100, ~$10
+
+# Model config (small for validation)
+model:
+  model_name: "Qwen/Qwen3-0.6B"
+  latent_dim: 512
+  compression_factor: 4  # 128 tokens -> 32 latents
+  codebook_size: 512
+  num_quantizers: 4  # K^D = 512^4 capacity
+  commitment_weight: 0.25
+
+# Data config (small subset)
+data:
+  dataset: "openwebtext"
+  max_length: 128
+  num_samples: 50000  # ~10M tokens
+  batch_size: 32
+  num_workers: 4
+  text_column: "text"
+
+# Training config
+training:
+  lr: 1e-4
+  weight_decay: 0.01
+  num_epochs: 5
+  warmup_epochs: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+# Logging
+logging:
+  wandb_project: "rq-vae-text"
+  wandb_run_name: "phase0-minimal"
+  log_interval: 50
+  eval_interval: 500
+  save_interval: 1000
+
+# Output
+output_dir: "./checkpoints/phase0"

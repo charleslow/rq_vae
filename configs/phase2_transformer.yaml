@@ -1,0 +1,43 @@
+# Phase 2: RQ-Transformer training
+# Target: ~8-12 hours on A100, ~$30
+
+# RQ-VAE checkpoint (set this to your trained VAE path)
+vae_checkpoint: "./checkpoints/phase1/rq_vae_final.pt"
+
+# RQ-Transformer config
+transformer:
+  dim: 512
+  spatial_layers: 12
+  depth_layers: 4
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+
+# Data config
+data:
+  dataset: "openwebtext"
+  tokenizer_name: "Qwen/Qwen3-0.6B"
+  max_length: 256  # Must match VAE training
+  num_samples: 500000
+  batch_size: 64
+  num_workers: 4
+  text_column: "text"
+
+# Training config
+training:
+  lr: 3e-4
+  weight_decay: 0.01
+  num_epochs: 10
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+# Logging
+logging:
+  wandb_project: "rq-vae-text"
+  wandb_run_name: "phase2-transformer"
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
+
+# Output
+output_dir: "./checkpoints/phase2"
