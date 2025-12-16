@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoConfig
+from unsloth import FastLanguageModel
 from einops import rearrange
 
 
@@ -19,6 +19,7 @@ class TextEncoder(nn.Module):
         latent_dim: int = 512,
         compression_factor: int = 4,
         freeze_backbone: bool = True,
+        num_latent_layers: int = 2,
     ):
         """
         Args:
@@ -26,20 +27,22 @@ class TextEncoder(nn.Module):
             latent_dim: Dimension of latent space (output of encoder)
             compression_factor: How much to compress sequence length (must be power of 2)
             freeze_backbone: Whether to freeze the pretrained model
+            num_latent_layers: Number of self-attention layers to refine latents (0 to disable)
         """
         super().__init__()
         self.model_name = model_name
         self.latent_dim = latent_dim
         self.compression_factor = compression_factor
+        self.num_latent_layers = num_latent_layers
 
-        # Load pretrained Qwen3
-        self.config = AutoConfig.from_pretrained(model_name)
-        self.backbone = AutoModel.from_pretrained(
-            model_name,
-            config=self.config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+        # Load pretrained Qwen3 with Unsloth optimizations
+        self.backbone, _ = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=2048,  # adjust based on your max sequence length
+            dtype=torch.bfloat16,
+            load_in_4bit=False,  # set to True for memory efficiency
         )
+        self.config = self.backbone.config
         self.hidden_size = self.config.hidden_size
 
         # Freeze backbone if specified
@@ -69,12 +72,54 @@ class TextEncoder(nn.Module):
         else:
             self.proj = nn.Identity()
 
+        # Latent refinement layers (self-attention on compressed sequence)
+        self.latent_refinement = self._create_latent_refinement(num_latent_layers)
+
     def _log2(self, x: int) -> int:
         """Compute log base 2, ensuring x is a power of 2."""
         import math
         result = int(math.log2(x))
         assert 2 ** result == x, f"compression_factor must be power of 2, got {x}"
         return result
+
+    def _create_latent_refinement(self, num_layers: int) -> nn.ModuleList:
+        """Create self-attention layers for latent refinement.
+
+        Args:
+            num_layers: Number of transformer layers (0 to disable)
+
+        Returns:
+            ModuleList of transformer encoder layers
+        """
+        if num_layers == 0:
+            return nn.ModuleList()
+
+        layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=self.latent_dim,
+                nhead=8,
+                dim_feedforward=self.latent_dim * 4,
+                dropout=0.1,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(num_layers)
+        ])
+        return layers
+
+    def _refine_latents(self, latent: torch.Tensor) -> torch.Tensor:
+        """Refine latents using self-attention.
+
+        Args:
+            latent: Latent representations (batch, seq_len, latent_dim)
+
+        Returns:
+            Refined latent representations (batch, seq_len, latent_dim)
+        """
+        for layer in self.latent_refinement:
+            latent = layer(latent)
+        return latent
 
     def freeze_backbone(self):
         """Freeze the pretrained backbone."""
@@ -121,7 +166,7 @@ class TextEncoder(nn.Module):
         hidden = rearrange(hidden, "b s d -> b d s")
 
         # Apply downsampling convolutions
-        for i, layer in enumerate(self.downsample):
+        for layer in self.downsample:
             if isinstance(layer, nn.LayerNorm):
                 # LayerNorm expects (batch, seq_len, dim)
                 hidden = rearrange(hidden, "b d s -> b s d")
@@ -135,6 +180,10 @@ class TextEncoder(nn.Module):
 
         # Final projection
         latent = self.proj(hidden)
+
+        # Refine latents with self-attention
+        if self.num_latent_layers > 0:
+            latent = self._refine_latents(latent)
 
         return latent
 
