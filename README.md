@@ -40,7 +40,7 @@ Other goals:
 
 ## Training Sequence
 
-The trainable components are encoder, RQ-codebook, decoder.
+The trainable components are encoder, RQ-codebook, decoder for the RQ-VAE portion, and also the RQ-transformer for the latent decoding.
 -  
 
 

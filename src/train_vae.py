@@ -1,21 +1,227 @@
-"""Stage 1: Train RQ-VAE for text reconstruction.
+"""Stage 1: Train RQ-VAE for text reconstruction using PyTorch Lightning.
 
 Trains the encoder-quantizer-decoder pipeline to reconstruct text.
 Uses Qwen3 backbone with frozen weights initially, then optionally unfreezes.
 """
 
-import os
 import argparse
+import os
+from typing import Any
+
+import lightning as L
 import torch
-import torch.nn.functional as F
+from lightning.pytorch.callbacks import (
+    LearningRateMonitor,
+    ModelCheckpoint,
+    RichProgressBar,
+)
+from lightning.pytorch.loggers import WandbLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from tqdm import tqdm
-import wandb
 
-from model import RQVAE
 from data import create_dataloader
+from model import RQVAE
+
+
+class RQVAELightningModule(L.LightningModule):
+    """PyTorch Lightning module for RQ-VAE training."""
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-0.6B",
+        latent_dim: int = 512,
+        compression_factor: int = 4,
+        codebook_size: int = 512,
+        num_quantizers: int = 8,
+        commitment_weight: float = 0.25,
+        lr: float = 1e-4,
+        weight_decay: float = 0.01,
+        warmup_epochs: int = 2,
+        num_epochs: int = 10,
+        total_steps: int | None = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        # Create model
+        self.model = RQVAE(
+            model_name=model_name,
+            latent_dim=latent_dim,
+            compression_factor=compression_factor,
+            codebook_size=codebook_size,
+            num_quantizers=num_quantizers,
+            commitment_weight=commitment_weight,
+            freeze_backbone=True,
+        )
+
+        # Store config
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.warmup_epochs = warmup_epochs
+        self.num_epochs = num_epochs
+        self.total_steps = total_steps
+        self.backbone_unfrozen = False
+
+        # For logging examples
+        self.tokenizer = None
+
+    def setup(self, stage: str) -> None:
+        """Setup tokenizer for decoding examples."""
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.model_name)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        return self.model(input_ids, attention_mask, labels=labels)
+
+    def on_train_epoch_start(self) -> None:
+        """Unfreeze backbone after warmup epochs."""
+        if self.current_epoch == self.warmup_epochs and not self.backbone_unfrozen:
+            self.print("Unfreezing backbone...")
+            self.model.unfreeze_backbone()
+            self.backbone_unfrozen = True
+
+            # Log trainable params
+            trainable_params = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            self.log("trainable_params_after_unfreeze", float(trainable_params))
+
+    def training_step(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+
+        outputs = self.model(input_ids, attention_mask, labels=input_ids)
+
+        # Log metrics
+        self.log("train/loss", outputs["total_loss"], prog_bar=True)
+        self.log("train/reconstruction_loss", outputs["reconstruction_loss"])
+        self.log("train/commitment_loss", outputs["commitment_loss"])
+        self.log("train/accuracy", outputs["accuracy"], prog_bar=True)
+        self.log("train/perplexity", outputs["perplexity"])
+
+        # Log codebook usage periodically
+        if batch_idx % 100 == 0:
+            usage = self.model.get_codebook_usage()
+            for i, u in enumerate(usage):
+                self.log(f"codebook/usage_level_{i}", u.item())
+
+        return outputs["total_loss"]
+
+    def validation_step(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+
+        outputs = self.model(input_ids, attention_mask, labels=input_ids)
+
+        self.log("val/loss", outputs["total_loss"], prog_bar=True, sync_dist=True)
+        self.log("val/reconstruction_loss", outputs["reconstruction_loss"], sync_dist=True)
+        self.log("val/accuracy", outputs["accuracy"], prog_bar=True, sync_dist=True)
+        self.log("val/perplexity", outputs["perplexity"], sync_dist=True)
+
+        # Log example reconstructions for first batch
+        if batch_idx == 0 and self.tokenizer is not None:
+            preds = outputs["logits"].argmax(dim=-1)
+            for j in range(min(3, input_ids.size(0))):
+                original = self.tokenizer.decode(input_ids[j], skip_special_tokens=True)
+                reconstructed = self.tokenizer.decode(preds[j], skip_special_tokens=True)
+                if self.logger:
+                    self.logger.experiment.log({
+                        f"examples/original_{j}": original[:200],
+                        f"examples/reconstructed_{j}": reconstructed[:200],
+                    })
+
+        return outputs["total_loss"]
+
+    def configure_optimizers(self):
+        # Use different learning rates based on whether backbone is frozen
+        if self.backbone_unfrozen:
+            lr = self.lr * 0.1
+        else:
+            lr = self.lr
+
+        optimizer = AdamW(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=lr,
+            weight_decay=self.weight_decay,
+        )
+
+        # Calculate total steps if not provided
+        if self.total_steps is None:
+            # Estimate from trainer
+            if self.trainer and self.trainer.estimated_stepping_batches:
+                total_steps = self.trainer.estimated_stepping_batches
+            else:
+                total_steps = 10000  # Default fallback
+        else:
+            total_steps = self.total_steps
+
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=lr * 0.1,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
+
+
+class RQVAEDataModule(L.LightningDataModule):
+    """DataModule for RQ-VAE training."""
+
+    def __init__(
+        self,
+        dataset_name: str = "openwebtext",
+        dataset_config: str | None = None,
+        tokenizer_name: str = "Qwen/Qwen3-0.6B",
+        max_length: int = 128,
+        batch_size: int = 32,
+        num_samples: int | None = None,
+        num_workers: int = 4,
+        text_column: str = "text",
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+    def setup(self, stage: str) -> None:
+        pass  # DataLoaders are created dynamically
+
+    def train_dataloader(self) -> DataLoader:
+        return create_dataloader(
+            dataset_name=self.hparams.dataset_name,
+            dataset_config=self.hparams.dataset_config,
+            split="train",
+            tokenizer_name=self.hparams.tokenizer_name,
+            max_length=self.hparams.max_length,
+            batch_size=self.hparams.batch_size,
+            num_samples=self.hparams.num_samples,
+            num_workers=self.hparams.num_workers,
+            shuffle=True,
+            text_column=self.hparams.text_column,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        # Use a subset of train for validation (or specify a val split)
+        return create_dataloader(
+            dataset_name=self.hparams.dataset_name,
+            dataset_config=self.hparams.dataset_config,
+            split="train",
+            tokenizer_name=self.hparams.tokenizer_name,
+            max_length=self.hparams.max_length,
+            batch_size=self.hparams.batch_size,
+            num_samples=min(self.hparams.num_samples or 1000, 1000),  # Limit val size
+            num_workers=self.hparams.num_workers,
+            shuffle=False,
+            text_column=self.hparams.text_column,
+        )
 
 
 def parse_args():
@@ -41,8 +247,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--num-epochs", type=int, default=10)
-    parser.add_argument("--warmup-epochs", type=int, default=2,
-                        help="Number of epochs to train with frozen backbone")
+    parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -50,281 +255,110 @@ def parse_args():
     # Logging arguments
     parser.add_argument("--wandb-project", type=str, default="rq-vae-text")
     parser.add_argument("--wandb-run-name", type=str, default=None)
-    parser.add_argument("--log-interval", type=int, default=100)
-    parser.add_argument("--eval-interval", type=int, default=1000)
+    parser.add_argument("--val-check-interval", type=float, default=0.25)
 
     # Checkpoint arguments
     parser.add_argument("--output-dir", type=str, default="./checkpoints")
-    parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--resume-from", type=str, default=None)
 
     # Device arguments
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--precision", type=str, default="bf16-mixed",
+                        choices=["32", "16-mixed", "bf16-mixed"])
+    parser.add_argument("--devices", type=int, default=1)
+    parser.add_argument("--strategy", type=str, default="auto")
 
     return parser.parse_args()
-
-
-def evaluate(model, dataloader, tokenizer, device, num_batches=50):
-    """Evaluate reconstruction quality."""
-    model.eval()
-
-    total_loss = 0
-    total_accuracy = 0
-    total_perplexity = 0
-    num_samples = 0
-
-    example_texts = []
-
-    with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            if i >= num_batches:
-                break
-
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-
-            outputs = model(input_ids, attention_mask, labels=input_ids)
-
-            total_loss += outputs["reconstruction_loss"].item() * input_ids.size(0)
-            total_accuracy += outputs["accuracy"].item() * input_ids.size(0)
-            total_perplexity += outputs["perplexity"].item() * input_ids.size(0)
-            num_samples += input_ids.size(0)
-
-            # Collect example reconstructions
-            if len(example_texts) < 5:
-                preds = outputs["logits"].argmax(dim=-1)
-                for j in range(min(2, input_ids.size(0))):
-                    original = tokenizer.decode(input_ids[j], skip_special_tokens=True)
-                    reconstructed = tokenizer.decode(preds[j], skip_special_tokens=True)
-                    example_texts.append({
-                        "original": original[:200],
-                        "reconstructed": reconstructed[:200],
-                    })
-
-    model.train()
-
-    return {
-        "eval_loss": total_loss / num_samples,
-        "eval_accuracy": total_accuracy / num_samples,
-        "eval_perplexity": total_perplexity / num_samples,
-        "examples": example_texts,
-    }
 
 
 def main():
     args = parse_args()
 
-    # Setup device
-    device = torch.device(args.device)
-    dtype = torch.bfloat16 if args.bf16 else torch.float32
-
-    # Initialize wandb
-    wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name,
-        config=vars(args),
-    )
-
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Create data module
+    data_module = RQVAEDataModule(
+        dataset_name=args.dataset,
+        dataset_config=args.dataset_config,
+        tokenizer_name=args.model_name,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        num_samples=args.num_samples,
+        num_workers=args.num_workers,
+        text_column=args.text_column,
+    )
 
     # Create model
-    print("Creating model...")
-    model = RQVAE(
+    model = RQVAELightningModule(
         model_name=args.model_name,
         latent_dim=args.latent_dim,
         compression_factor=args.compression_factor,
         codebook_size=args.codebook_size,
         num_quantizers=args.num_quantizers,
         commitment_weight=args.commitment_weight,
-        freeze_backbone=True,  # Start with frozen backbone
-    )
-    model = model.to(device)
-
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    wandb.log({"total_params": total_params, "trainable_params": trainable_params})
-
-    # Create dataloaders
-    print("Loading data...")
-    train_loader = create_dataloader(
-        dataset_name=args.dataset,
-        dataset_config=args.dataset_config,
-        split="train",
-        tokenizer_name=args.model_name,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        num_samples=args.num_samples,
-        num_workers=args.num_workers,
-        shuffle=True,
-        text_column=args.text_column,
-    )
-
-    # Create optimizer (only for trainable params initially)
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         weight_decay=args.weight_decay,
+        warmup_epochs=args.warmup_epochs,
+        num_epochs=args.num_epochs,
     )
 
-    # Create scheduler
-    total_steps = len(train_loader) * args.num_epochs // args.gradient_accumulation_steps
-    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
+    # Setup logger
+    logger = WandbLogger(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        save_dir=args.output_dir,
+        config=vars(args),
+    )
 
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    global_step = 0
-    if args.resume_from:
-        print(f"Resuming from {args.resume_from}")
-        checkpoint = torch.load(args.resume_from, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        start_epoch = checkpoint["epoch"]
-        global_step = checkpoint["global_step"]
+    # Setup callbacks
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=args.output_dir,
+            filename="rqvae-{epoch:02d}-{val/loss:.4f}",
+            save_top_k=3,
+            monitor="val/loss",
+            mode="min",
+            save_last=True,
+        ),
+        LearningRateMonitor(logging_interval="step"),
+        RichProgressBar(),
+    ]
 
-    # Training loop
-    print("Starting training...")
-    model.train()
+    # Create trainer
+    trainer = L.Trainer(
+        max_epochs=args.num_epochs,
+        accelerator="auto",
+        devices=args.devices,
+        strategy=args.strategy,
+        precision=args.precision,
+        accumulate_grad_batches=args.gradient_accumulation_steps,
+        gradient_clip_val=args.max_grad_norm,
+        val_check_interval=args.val_check_interval,
+        logger=logger,
+        callbacks=callbacks,
+        default_root_dir=args.output_dir,
+    )
 
-    for epoch in range(start_epoch, args.num_epochs):
-        # Unfreeze backbone after warmup
-        if epoch == args.warmup_epochs:
-            print("Unfreezing backbone...")
-            model.unfreeze_backbone()
-
-            # Recreate optimizer with all parameters
-            optimizer = AdamW(
-                model.parameters(),
-                lr=args.lr * 0.1,  # Lower LR for fine-tuning
-                weight_decay=args.weight_decay,
-            )
-            remaining_steps = (args.num_epochs - epoch) * len(train_loader) // args.gradient_accumulation_steps
-            scheduler = CosineAnnealingLR(optimizer, T_max=remaining_steps, eta_min=args.lr * 0.01)
-
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"Trainable parameters after unfreeze: {trainable_params:,}")
-            wandb.log({"trainable_params_after_unfreeze": trainable_params})
-
-        epoch_loss = 0
-        epoch_accuracy = 0
-        num_batches = 0
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}")
-
-        for batch_idx, batch in enumerate(pbar):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-
-            # Forward pass
-            with torch.autocast(device_type="cuda", dtype=dtype, enabled=args.bf16):
-                outputs = model(input_ids, attention_mask, labels=input_ids)
-                loss = outputs["total_loss"] / args.gradient_accumulation_steps
-
-            # Backward pass
-            loss.backward()
-
-            # Gradient accumulation
-            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-
-            # Logging
-            epoch_loss += outputs["total_loss"].item()
-            epoch_accuracy += outputs["accuracy"].item()
-            num_batches += 1
-
-            pbar.set_postfix({
-                "loss": outputs["total_loss"].item(),
-                "acc": outputs["accuracy"].item(),
-                "ppl": outputs["perplexity"].item(),
-            })
-
-            # Log to wandb
-            if global_step % args.log_interval == 0:
-                wandb.log({
-                    "train/loss": outputs["total_loss"].item(),
-                    "train/reconstruction_loss": outputs["reconstruction_loss"].item(),
-                    "train/commitment_loss": outputs["commitment_loss"].item(),
-                    "train/accuracy": outputs["accuracy"].item(),
-                    "train/perplexity": outputs["perplexity"].item(),
-                    "train/lr": scheduler.get_last_lr()[0],
-                    "train/epoch": epoch,
-                    "train/global_step": global_step,
-                }, step=global_step)
-
-                # Log codebook usage
-                usage = model.get_codebook_usage()
-                for i, u in enumerate(usage):
-                    wandb.log({f"codebook/usage_level_{i}": u.item()}, step=global_step)
-
-            # Evaluation
-            if global_step % args.eval_interval == 0:
-                eval_results = evaluate(model, train_loader, tokenizer, device)
-                wandb.log({
-                    "eval/loss": eval_results["eval_loss"],
-                    "eval/accuracy": eval_results["eval_accuracy"],
-                    "eval/perplexity": eval_results["eval_perplexity"],
-                }, step=global_step)
-
-                # Log example reconstructions
-                for i, ex in enumerate(eval_results["examples"][:3]):
-                    wandb.log({
-                        f"examples/original_{i}": ex["original"],
-                        f"examples/reconstructed_{i}": ex["reconstructed"],
-                    }, step=global_step)
-
-                model.train()
-
-            # Save checkpoint
-            if global_step % args.save_interval == 0:
-                checkpoint_path = os.path.join(
-                    args.output_dir, f"checkpoint_step_{global_step}.pt"
-                )
-                torch.save({
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "config": vars(args),
-                }, checkpoint_path)
-                print(f"Saved checkpoint to {checkpoint_path}")
-
-        # End of epoch
-        avg_loss = epoch_loss / num_batches
-        avg_accuracy = epoch_accuracy / num_batches
-        print(f"Epoch {epoch + 1} - Avg Loss: {avg_loss:.4f}, Avg Accuracy: {avg_accuracy:.4f}")
-
-        # Save end-of-epoch checkpoint
-        checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch + 1}.pt")
-        torch.save({
-            "epoch": epoch + 1,
-            "global_step": global_step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "config": vars(args),
-        }, checkpoint_path)
+    # Train
+    trainer.fit(
+        model,
+        datamodule=data_module,
+        ckpt_path=args.resume_from,
+    )
 
     # Save final model
     final_path = os.path.join(args.output_dir, "rq_vae_final.pt")
-    model.save_pretrained(final_path)
+    torch.save({
+        "model_state_dict": model.model.state_dict(),
+        "config": {
+            "model_name": args.model_name,
+            "latent_dim": args.latent_dim,
+            "compression_factor": args.compression_factor,
+            "codebook_size": args.codebook_size,
+            "num_quantizers": args.num_quantizers,
+        },
+    }, final_path)
     print(f"Saved final model to {final_path}")
-
-    wandb.finish()
 
 
 if __name__ == "__main__":
