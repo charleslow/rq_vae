@@ -10,6 +10,8 @@ try:
 except (ImportError, NotImplementedError):
     UNSLOTH_AVAILABLE = False
 
+from utils import log2_int
+
 from .layers import SwiGLUTransformerLayer
 
 
@@ -88,7 +90,7 @@ class TextEncoder(nn.Module):
 
         # Downsampling layers using strided convolutions
         # Each conv with stride 2 halves the sequence length
-        num_downsample = self._log2(compression_factor)
+        num_downsample = log2_int(compression_factor)
         downsample_layers = []
         in_dim = self.hidden_size
 
@@ -111,13 +113,6 @@ class TextEncoder(nn.Module):
 
         # Latent refinement layers (self-attention on compressed sequence)
         self.latent_refinement = self._create_latent_refinement(num_latent_layers)
-
-    def _log2(self, x: int) -> int:
-        """Compute log base 2, ensuring x is a power of 2."""
-        import math
-        result = int(math.log2(x))
-        assert 2 ** result == x, f"compression_factor must be power of 2, got {x}"
-        return result
 
     def _create_latent_refinement(self, num_layers: int) -> nn.ModuleList:
         """Create self-attention layers for latent refinement with SwiGLU FFN.

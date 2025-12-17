@@ -41,6 +41,9 @@ Other goals:
 ## Training Sequence
 
 The trainable components are encoder, RQ-codebook, decoder for the RQ-VAE portion, and also the RQ-transformer for the latent decoding.
--  
+- Train the RQ-VAE jointly
+    - Freeze pretrained qwen backbone for warmup
+    - Then unfreeze for full training
+- Train the RQ-transformer on latent sequences
 
 
