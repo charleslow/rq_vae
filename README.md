@@ -25,5 +25,22 @@ Other goals:
 - Test performance - inference speed trade-off as we increase compression factor
 - Test codebook vocabulary size to codebook depth tradeoff
 - Test if unsloth speeds up inference significantly
+- Test if we can scale to 8B models
+
+## Overall Flow
+
+- Start with text input (e.g. openwebtext)
+- Encode into a latent representation that is a shorter sequence
+    - Run through pretrained backbone (e.g. `qwen0.6B`)
+    - Downsample using convolutions
+- Run RQ-VAE on the latent representation to discretize into latent tokens
+- Decode latent tokens back into original textual space
+    - Upsample using de-convolutions
+    - Run through pretrained backbone (e.g. `qwen0.6B`)
+
+## Training Sequence
+
+The trainable components are encoder, RQ-codebook, decoder.
+-  
 
 

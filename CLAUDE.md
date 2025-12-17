@@ -6,6 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 RQ-VAE (Residual Quantized Variational Autoencoder) experiments for fast text decoding. This project explores applying RQ-VAE techniques to accelerate text generation/decoding in language models.
 
-## Project Status
+## Test configuration
 
-This is a new Python project. No code has been added yet.
+Maintain a minimal set of tests that tests only the critical logic of the modules. Aim for readable and essential tests that are easier to maintain rather than exhausting all possibilities.

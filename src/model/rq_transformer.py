@@ -33,8 +33,196 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.pe[:seq_len]
 
 
+class RotaryPositionalEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE).
+
+    Applies rotations to query and key vectors based on position.
+    Better extrapolation properties than additive positional embeddings.
+
+    Reference: https://arxiv.org/abs/2104.09864
+    """
+
+    def __init__(self, dim: int, max_len: int = 8192, base: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_len = max_len
+        self.base = base
+
+        # Compute inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+        # Pre-compute cos and sin for efficiency
+        self._build_cache(max_len)
+
+    def _build_cache(self, seq_len: int):
+        """Build cos/sin cache for given sequence length."""
+        positions = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(positions, self.inv_freq)  # (seq_len, dim/2)
+
+        # Duplicate for both sin and cos parts
+        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, dim)
+
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get cos and sin for given sequence length.
+
+        Args:
+            seq_len: Sequence length
+
+        Returns:
+            Tuple of (cos, sin) tensors of shape (seq_len, dim)
+        """
+        if seq_len > self.cos_cached.shape[0]:
+            self._build_cache(seq_len)
+
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims of the input."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings to query and key tensors.
+
+    Args:
+        q: Query tensor (batch, num_heads, seq_len, head_dim)
+        k: Key tensor (batch, num_heads, seq_len, head_dim)
+        cos: Cosine of rotation angles (seq_len, head_dim) or (batch, seq_len, head_dim)
+        sin: Sine of rotation angles (seq_len, head_dim) or (batch, seq_len, head_dim)
+        position_ids: Optional position indices for gathering from cos/sin cache
+
+    Returns:
+        Rotated query and key tensors
+    """
+    if position_ids is not None:
+        # Gather cos/sin for specific positions
+        cos = cos[position_ids]  # (batch, seq_len, dim)
+        sin = sin[position_ids]
+
+    # Expand for broadcasting with heads dimension
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, dim)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    elif cos.dim() == 3:
+        cos = cos.unsqueeze(1)  # (batch, 1, seq_len, dim)
+        sin = sin.unsqueeze(1)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    return q_embed, k_embed
+
+
+class RoPEAttention(nn.Module):
+    """Multi-head attention with Rotary Position Embeddings."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        max_seq_len: int = 8192,
+        rope_base: float = 10000.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
+
+        # RoPE
+        self.rope = RotaryPositionalEmbedding(self.head_dim, max_seq_len, rope_base)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass with RoPE.
+
+        Args:
+            x: Input tensor (batch, seq_len, dim)
+            attn_mask: Optional attention mask
+            is_causal: Whether to apply causal masking
+            position_ids: Optional position indices for RoPE
+
+        Returns:
+            Output tensor (batch, seq_len, dim)
+        """
+        batch, seq_len, _ = x.shape
+
+        # Project to Q, K, V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape for multi-head attention
+        q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
+        k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
+        v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
+
+        # Apply RoPE to Q and K
+        cos, sin = self.rope(seq_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+        # Compute attention with scaled dot product
+        # Use PyTorch's efficient implementation when available
+        if hasattr(F, "scaled_dot_product_attention"):
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=is_causal and attn_mask is None,
+            )
+        else:
+            # Manual implementation fallback
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+            if is_causal and attn_mask is None:
+                causal_mask = torch.triu(
+                    torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
+                    diagonal=1
+                )
+                attn_weights.masked_fill_(causal_mask, float("-inf"))
+            elif attn_mask is not None:
+                attn_weights = attn_weights + attn_mask
+
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            attn_out = torch.matmul(attn_weights, v)
+
+        # Reshape and project output
+        attn_out = rearrange(attn_out, "b h s d -> b s (h d)")
+        return self.out_proj(attn_out)
+
+
 class TransformerBlock(nn.Module):
-    """Standard transformer block with pre-norm."""
+    """Standard transformer block with pre-norm.
+
+    Supports both standard attention and RoPE attention.
+    """
 
     def __init__(
         self,
@@ -43,17 +231,31 @@ class TransformerBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         causal: bool = True,
+        use_rope: bool = False,
+        max_seq_len: int = 8192,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         self.causal = causal
+        self.use_rope = use_rope
 
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+
+        if use_rope:
+            self.attn = RoPEAttention(
+                dim=dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                max_seq_len=max_seq_len,
+                rope_base=rope_base,
+            )
+        else:
+            self.attn = nn.MultiheadAttention(
+                embed_dim=dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
 
         self.norm2 = nn.LayerNorm(dim)
         mlp_dim = int(dim * mlp_ratio)
@@ -69,23 +271,35 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self-attention with pre-norm
         normed = self.norm1(x)
 
-        # Create causal mask if needed
-        if self.causal and attn_mask is None:
-            seq_len = x.shape[1]
-            attn_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
-                diagonal=1
+        if self.use_rope:
+            # RoPE attention handles causal masking internally
+            attn_out = self.attn(
+                normed,
+                attn_mask=attn_mask,
+                is_causal=self.causal,
+                position_ids=position_ids,
+            )
+        else:
+            # Standard attention
+            # Create causal mask if needed
+            if self.causal and attn_mask is None:
+                seq_len = x.shape[1]
+                attn_mask = torch.triu(
+                    torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
+                    diagonal=1
+                )
+
+            attn_out, _ = self.attn(
+                normed, normed, normed,
+                attn_mask=attn_mask,
+                is_causal=self.causal and attn_mask is None,
             )
 
-        attn_out, _ = self.attn(
-            normed, normed, normed,
-            attn_mask=attn_mask,
-            is_causal=self.causal and attn_mask is None,
-        )
         x = x + attn_out
 
         # MLP with pre-norm
@@ -98,7 +312,7 @@ class SpatialTransformer(nn.Module):
     """Spatial transformer that processes T positions.
 
     At each position t, input is:
-    - PE_T(t): positional encoding
+    - PE_T(t): positional encoding (additive) OR RoPE (applied to attention)
     - Sum of embeddings from previous position's D codes
 
     Outputs context vector h_t for each position.
@@ -114,24 +328,36 @@ class SpatialTransformer(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         max_seq_len: int = 512,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
         self.num_quantizers = num_quantizers
+        self.use_rope = use_rope
 
         # Embeddings for codebook indices (shared across depth levels)
         self.code_embed = nn.Embedding(codebook_size, dim)
 
-        # Positional encoding for spatial positions
-        self.pos_encoding = SinusoidalPositionalEncoding(dim, max_seq_len)
+        # Positional encoding for spatial positions (only used if not using RoPE)
+        if not use_rope:
+            self.pos_encoding = SinusoidalPositionalEncoding(dim, max_seq_len)
+        else:
+            self.pos_encoding = None
 
         # Start of sequence token
         self.sos_token = nn.Parameter(torch.randn(dim) * 0.02)
 
         # Transformer layers
         self.layers = nn.ModuleList([
-            TransformerBlock(dim, num_heads, mlp_ratio, dropout, causal=True)
+            TransformerBlock(
+                dim, num_heads, mlp_ratio, dropout,
+                causal=True,
+                use_rope=use_rope,
+                max_seq_len=max_seq_len,
+                rope_base=rope_base,
+            )
             for _ in range(num_layers)
         ])
 
@@ -162,11 +388,9 @@ class SpatialTransformer(nn.Module):
 
         # Build input sequence
         # u_1 = SOS token
-        # u_t = PE_T(t) + sum(embeddings of codes at position t-1) for t > 1
-
-        # Get positional encodings
-        pos_enc = self.pos_encoding(T)  # (T, dim)
-        pos_enc = repeat(pos_enc, "t d -> b t d", b=batch)
+        # u_t = sum(embeddings of codes at position t-1)
+        # With RoPE: positional info is in attention, not added to embeddings
+        # Without RoPE: add sinusoidal positional encoding
 
         if indices is not None:
             # Get code embeddings and sum across depth
@@ -179,12 +403,17 @@ class SpatialTransformer(nn.Module):
             sos = repeat(self.sos_token, "d -> b 1 d", b=batch)
             shifted_embeds = torch.cat([sos, summed_embeds[:, :-1]], dim=1)  # (batch, T, dim)
 
-            # Combine positional encoding and shifted embeddings
-            x = pos_enc + shifted_embeds
+            x = shifted_embeds
         else:
-            # Inference mode: just positional encodings + SOS
-            x = pos_enc
-            x[:, 0] = x[:, 0] + self.sos_token
+            # Inference mode: start with zeros, first position gets SOS
+            x = torch.zeros(batch, T, self.dim, device=device)
+            x[:, 0] = self.sos_token
+
+        # Add positional encoding if not using RoPE
+        if not self.use_rope and self.pos_encoding is not None:
+            pos_enc = self.pos_encoding(T)  # (T, dim)
+            pos_enc = repeat(pos_enc, "t d -> b t d", b=batch)
+            x = x + pos_enc
 
         # Apply transformer layers
         for layer in self.layers:
@@ -199,7 +428,7 @@ class DepthTransformer(nn.Module):
     """Depth transformer that predicts D codes for each spatial position.
 
     At each depth d, input is:
-    - PE_D(d): depth positional encoding
+    - PE_D(d): depth positional encoding (learnable or RoPE)
     - h_t: spatial context from SpatialTransformer
     - Sum of embeddings from previously predicted codes at this position
 
@@ -215,21 +444,31 @@ class DepthTransformer(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
         self.num_quantizers = num_quantizers
+        self.use_rope = use_rope
 
         # Embeddings for codebook indices
         self.code_embed = nn.Embedding(codebook_size, dim)
 
-        # Depth positional encoding (learnable)
+        # Depth positional encoding (learnable) - used for additive encoding
+        # Keep learnable embeddings even with RoPE to add to h_t for depth conditioning
         self.depth_pos_embed = nn.Embedding(num_quantizers, dim)
 
         # Transformer layers
         self.layers = nn.ModuleList([
-            TransformerBlock(dim, num_heads, mlp_ratio, dropout, causal=True)
+            TransformerBlock(
+                dim, num_heads, mlp_ratio, dropout,
+                causal=True,
+                use_rope=use_rope,
+                max_seq_len=num_quantizers,  # Depth sequence is at most num_quantizers
+                rope_base=rope_base,
+            )
             for _ in range(num_layers)
         ])
 
@@ -347,6 +586,8 @@ class RQTransformer(nn.Module):
     - Spatial transformer: O(T^2) for T positions
     - Depth transformer: O(D^2) per position, O(T*D^2) total
     - Combined: O(T^2 + T*D^2) vs O((T*D)^2) for naive approach
+
+    Supports both standard sinusoidal positional encoding and RoPE.
     """
 
     def __init__(
@@ -360,6 +601,8 @@ class RQTransformer(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         max_seq_len: int = 512,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
     ):
         """
         Args:
@@ -372,11 +615,14 @@ class RQTransformer(nn.Module):
             mlp_ratio: MLP expansion ratio
             dropout: Dropout rate
             max_seq_len: Maximum sequence length
+            use_rope: Whether to use Rotary Position Embeddings instead of sinusoidal
+            rope_base: Base frequency for RoPE (default 10000)
         """
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
         self.num_quantizers = num_quantizers
+        self.use_rope = use_rope
 
         self.spatial_transformer = SpatialTransformer(
             dim=dim,
@@ -387,6 +633,8 @@ class RQTransformer(nn.Module):
             mlp_ratio=mlp_ratio,
             dropout=dropout,
             max_seq_len=max_seq_len,
+            use_rope=use_rope,
+            rope_base=rope_base,
         )
 
         self.depth_transformer = DepthTransformer(
@@ -397,6 +645,8 @@ class RQTransformer(nn.Module):
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             dropout=dropout,
+            use_rope=use_rope,
+            rope_base=rope_base,
         )
 
     def forward(
@@ -467,15 +717,18 @@ class RQTransformer(nn.Module):
                 # First position: use SOS
                 h_t = self.spatial_transformer.sos_token.unsqueeze(0)  # (1, dim)
                 h_t = repeat(h_t, "1 d -> b d", b=batch_size)
-                h_t = h_t + self.spatial_transformer.pos_encoding(1)[0]
+                # Add positional encoding only if not using RoPE
+                if not self.use_rope and self.spatial_transformer.pos_encoding is not None:
+                    h_t = h_t + self.spatial_transformer.pos_encoding(1)[0]
             else:
                 # Use previous codes to compute spatial context
                 prev_indices = torch.stack(generated, dim=1)  # (batch, t, D)
                 h = self.spatial_transformer(prev_indices)  # (batch, t, dim)
                 h_t = h[:, -1]  # (batch, dim) - context for current position
 
-                # Add positional encoding for current position
-                h_t = h_t + self.spatial_transformer.pos_encoding(t + 1)[t]
+                # Add positional encoding for current position only if not using RoPE
+                if not self.use_rope and self.spatial_transformer.pos_encoding is not None:
+                    h_t = h_t + self.spatial_transformer.pos_encoding(t + 1)[t]
 
             # Generate D codes for this position using depth transformer
             codes_t = []

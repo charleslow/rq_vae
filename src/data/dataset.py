@@ -1,10 +1,13 @@
 """Data loading utilities for RQ-VAE training."""
 
+from collections.abc import Iterator
+
 import torch
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
 from datasets import load_dataset
-from typing import Iterator
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer
+
+# TODO: Change to use fineweb instead of openwebtext
 
 
 class TextDataset(Dataset):
@@ -108,9 +111,7 @@ class StreamingTextDataset:
 
         # Load streaming dataset
         if dataset_config:
-            self.dataset = load_dataset(
-                dataset_name, dataset_config, split=split, streaming=True
-            )
+            self.dataset = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
         else:
             self.dataset = load_dataset(dataset_name, split=split, streaming=True)
 

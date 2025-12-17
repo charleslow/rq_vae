@@ -4,25 +4,25 @@ Trains the spatial-depth transformer to predict RQ-VAE latent codes.
 Uses pre-trained RQ-VAE to extract codes from text.
 """
 
-import os
 import argparse
+import os
+
 import torch
+import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import AutoTokenizer
 from tqdm import tqdm
-import wandb
+from transformers import AutoTokenizer
 
-from model import RQVAE, RQTransformer
 from data import create_dataloader
+from model import RQVAE, RQTransformer
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train RQ-Transformer for latent prediction")
 
     # RQ-VAE checkpoint (required)
-    parser.add_argument("--vae-checkpoint", type=str, required=True,
-                        help="Path to trained RQ-VAE checkpoint")
+    parser.add_argument("--vae-checkpoint", type=str, required=True, help="Path to trained RQ-VAE checkpoint")
 
     # RQ-Transformer arguments
     parser.add_argument("--dim", type=int, default=512)
@@ -133,10 +133,12 @@ def evaluate(transformer, vae, dataloader, tokenizer, device, dtype, num_batches
             for j in range(min(2, input_ids.size(0))):
                 original = tokenizer.decode(input_ids[j], skip_special_tokens=True)
                 reconstructed = tokenizer.decode(pred_tokens[j], skip_special_tokens=True)
-                example_texts.append({
-                    "original": original[:200],
-                    "reconstructed": reconstructed[:200],
-                })
+                example_texts.append(
+                    {
+                        "original": original[:200],
+                        "reconstructed": reconstructed[:200],
+                    }
+                )
 
     transformer.train()
 
@@ -268,10 +270,9 @@ def main():
             attention_mask = batch["attention_mask"].to(device)
 
             # Extract codes from VAE (no grad needed)
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=dtype):
-                    enc_out = vae.encode(input_ids, attention_mask)
-                    codes = enc_out["indices"]  # (batch, compressed_len, num_quantizers)
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
+                enc_out = vae.encode(input_ids, attention_mask)
+                codes = enc_out["indices"]  # (batch, compressed_len, num_quantizers)
 
             # Forward pass through transformer
             with torch.autocast(device_type="cuda", dtype=dtype):
@@ -299,65 +300,75 @@ def main():
             epoch_accuracy += accuracy.item()
             num_batches += 1
 
-            pbar.set_postfix({
-                "loss": outputs["loss"].item(),
-                "acc": accuracy.item(),
-            })
+            pbar.set_postfix(
+                {
+                    "loss": outputs["loss"].item(),
+                    "acc": accuracy.item(),
+                }
+            )
 
             # Log to wandb
             if global_step % args.log_interval == 0:
-                wandb.log({
-                    "train/loss": outputs["loss"].item(),
-                    "train/code_accuracy": accuracy.item(),
-                    "train/lr": scheduler.get_last_lr()[0],
-                    "train/epoch": epoch,
-                    "train/global_step": global_step,
-                }, step=global_step)
+                wandb.log(
+                    {
+                        "train/loss": outputs["loss"].item(),
+                        "train/code_accuracy": accuracy.item(),
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/epoch": epoch,
+                        "train/global_step": global_step,
+                    },
+                    step=global_step,
+                )
 
             # Evaluation
             if global_step % args.eval_interval == 0:
-                eval_results = evaluate(
-                    transformer, vae, train_loader, tokenizer, device, dtype
+                eval_results = evaluate(transformer, vae, train_loader, tokenizer, device, dtype)
+                wandb.log(
+                    {
+                        "eval/loss": eval_results["eval_loss"],
+                        "eval/code_accuracy": eval_results["eval_code_accuracy"],
+                        "eval/text_accuracy": eval_results["eval_text_accuracy"],
+                    },
+                    step=global_step,
                 )
-                wandb.log({
-                    "eval/loss": eval_results["eval_loss"],
-                    "eval/code_accuracy": eval_results["eval_code_accuracy"],
-                    "eval/text_accuracy": eval_results["eval_text_accuracy"],
-                }, step=global_step)
 
                 # Log example reconstructions
                 for i, ex in enumerate(eval_results["examples"][:3]):
-                    wandb.log({
-                        f"examples/original_{i}": ex["original"],
-                        f"examples/reconstructed_{i}": ex["reconstructed"],
-                    }, step=global_step)
+                    wandb.log(
+                        {
+                            f"examples/original_{i}": ex["original"],
+                            f"examples/reconstructed_{i}": ex["reconstructed"],
+                        },
+                        step=global_step,
+                    )
 
                 transformer.train()
 
             # Save checkpoint
             if global_step % args.save_interval == 0:
-                checkpoint_path = os.path.join(
-                    args.output_dir, f"transformer_step_{global_step}.pt"
-                )
-                torch.save({
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "model_state_dict": transformer.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "config": {
-                        "dim": args.dim,
-                        "codebook_size": vae_config["codebook_size"],
-                        "num_quantizers": vae_config["num_quantizers"],
-                        "spatial_layers": args.spatial_layers,
-                        "depth_layers": args.depth_layers,
-                        "num_heads": args.num_heads,
-                        "mlp_ratio": args.mlp_ratio,
-                        "dropout": args.dropout,
-                        "max_seq_len": compressed_len,
+                checkpoint_path = os.path.join(args.output_dir, f"transformer_step_{global_step}.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "model_state_dict": transformer.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "config": {
+                            "dim": args.dim,
+                            "codebook_size": vae_config["codebook_size"],
+                            "num_quantizers": vae_config["num_quantizers"],
+                            "spatial_layers": args.spatial_layers,
+                            "depth_layers": args.depth_layers,
+                            "num_heads": args.num_heads,
+                            "mlp_ratio": args.mlp_ratio,
+                            "dropout": args.dropout,
+                            "max_seq_len": compressed_len,
+                        },
+                        "vae_checkpoint": args.vae_checkpoint,
                     },
-                    "vae_checkpoint": args.vae_checkpoint,
-                }, checkpoint_path)
+                    checkpoint_path,
+                )
                 print(f"Saved checkpoint to {checkpoint_path}")
 
         # End of epoch
@@ -367,12 +378,34 @@ def main():
 
         # Save end-of-epoch checkpoint
         checkpoint_path = os.path.join(args.output_dir, f"transformer_epoch_{epoch + 1}.pt")
-        torch.save({
-            "epoch": epoch + 1,
-            "global_step": global_step,
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "model_state_dict": transformer.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "config": {
+                    "dim": args.dim,
+                    "codebook_size": vae_config["codebook_size"],
+                    "num_quantizers": vae_config["num_quantizers"],
+                    "spatial_layers": args.spatial_layers,
+                    "depth_layers": args.depth_layers,
+                    "num_heads": args.num_heads,
+                    "mlp_ratio": args.mlp_ratio,
+                    "dropout": args.dropout,
+                    "max_seq_len": compressed_len,
+                },
+                "vae_checkpoint": args.vae_checkpoint,
+            },
+            checkpoint_path,
+        )
+
+    # Save final model
+    final_path = os.path.join(args.output_dir, "rq_transformer_final.pt")
+    torch.save(
+        {
             "model_state_dict": transformer.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
             "config": {
                 "dim": args.dim,
                 "codebook_size": vae_config["codebook_size"],
@@ -385,25 +418,9 @@ def main():
                 "max_seq_len": compressed_len,
             },
             "vae_checkpoint": args.vae_checkpoint,
-        }, checkpoint_path)
-
-    # Save final model
-    final_path = os.path.join(args.output_dir, "rq_transformer_final.pt")
-    torch.save({
-        "model_state_dict": transformer.state_dict(),
-        "config": {
-            "dim": args.dim,
-            "codebook_size": vae_config["codebook_size"],
-            "num_quantizers": vae_config["num_quantizers"],
-            "spatial_layers": args.spatial_layers,
-            "depth_layers": args.depth_layers,
-            "num_heads": args.num_heads,
-            "mlp_ratio": args.mlp_ratio,
-            "dropout": args.dropout,
-            "max_seq_len": compressed_len,
         },
-        "vae_checkpoint": args.vae_checkpoint,
-    }, final_path)
+        final_path,
+    )
     print(f"Saved final model to {final_path}")
 
     wandb.finish()
