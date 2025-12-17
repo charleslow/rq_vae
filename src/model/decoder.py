@@ -3,7 +3,13 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-from unsloth import FastLanguageModel
+
+try:
+    from unsloth import FastLanguageModel
+
+    UNSLOTH_AVAILABLE = True
+except (ImportError, NotImplementedError):
+    UNSLOTH_AVAILABLE = False
 
 from .layers import SwiGLUTransformerLayer
 
@@ -15,7 +21,7 @@ class TextDecoder(nn.Module):
     and outputs logits over vocabulary (decoded into tokens).
 
     Steps:
-    1. Input compressed latents:
+    1. Input is a sequence of compressed latents:
         (batch, compressed_len, latent_dim)
     2. Refine latents with self-attention:
         (batch, compressed_len, latent_dim)
@@ -53,22 +59,39 @@ class TextDecoder(nn.Module):
         self.latent_dim = latent_dim
         self.compression_factor = compression_factor
         self.num_latent_layers = num_latent_layers
-        self.backbone, _ = FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=2048,  # adjust based on your max sequence length
-            dtype=torch.bfloat16,
-            load_in_4bit=False,  # set to True for memory efficiency
-        )
-        self.config = self.backbone.config
-        self.hidden_size = self.config.hidden_size
-        self.vocab_size = vocab_size or self.config.vocab_size
+
+        # Load pretrained model (use Unsloth if available, otherwise standard transformers)
+        if UNSLOTH_AVAILABLE and torch.cuda.is_available():
+            try:
+                self.backbone, _ = FastLanguageModel.from_pretrained(
+                    model_name=model_name,
+                    max_seq_length=2048,
+                    dtype=torch.bfloat16,
+                    load_in_4bit=False,
+                )
+                self.config = self.backbone.config
+                self.hidden_size = self.config.hidden_size
+                self.vocab_size = vocab_size or self.config.vocab_size
+            except Exception:
+                # Fallback to standard transformers if Unsloth fails
+                from transformers import AutoModel
+                self.backbone = AutoModel.from_pretrained(model_name)
+                self.config = self.backbone.config
+                self.hidden_size = self.config.hidden_size
+                self.vocab_size = vocab_size or self.config.vocab_size
+        else:
+            # Use standard transformers on CPU or when Unsloth not available
+            from transformers import AutoModel
+            self.backbone = AutoModel.from_pretrained(model_name)
+            self.config = self.backbone.config
+            self.hidden_size = self.config.hidden_size
+            self.vocab_size = vocab_size or self.config.vocab_size
 
         if freeze_backbone:
             self.freeze_backbone()
 
         # Latent refinement layers (self-attention on compressed sequence)
         self.latent_refinement = self._create_latent_refinement(num_latent_layers)
-
         self.input_proj = nn.Linear(latent_dim, self.hidden_size)
         self.upsample_layers = self._create_upsample_layers(compression_factor)
         self.output_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
@@ -121,6 +144,13 @@ class TextDecoder(nn.Module):
     def _create_upsample_layers(self, compression_factor: int) -> nn.Sequential:
         """Create upsampling layers using transposed convolutions.
 
+        How it works:
+            ConvTranspose1d is a de-convolution that increases sequence length.
+            First we add a space between each input token
+            Then we use a kernel splat to fill in the gaps
+            Then we trim away the padding (first and last token)
+            This will return a sequence twice as long as the input.
+
         Args:
             compression_factor: How much to expand sequence length (must be power of 2)
 
@@ -129,7 +159,6 @@ class TextDecoder(nn.Module):
         """
         num_upsample = self._log2(compression_factor)
         upsample_layers = []
-
         for _ in range(num_upsample):
             upsample_layers.extend(
                 [
@@ -138,7 +167,6 @@ class TextDecoder(nn.Module):
                     nn.LayerNorm(self.hidden_size),
                 ]
             )
-
         return nn.Sequential(*upsample_layers)
 
     def _upsample(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -194,22 +222,17 @@ class TextDecoder(nn.Module):
         """
         batch, compressed_len, _ = latent.shape
 
-        # Refine latents with self-attention
+        # First use self-attention to refine latent representation
         if self.num_latent_layers > 0:
             latent = self._refine_latents(latent)
-
-        # Project to backbone hidden size
         hidden = self.input_proj(latent)  # (batch, compressed_len, hidden_size)
 
-        # Upsample to target sequence length
+        # Then use deconvolution to upsample to full sequence length
         hidden = self._upsample(hidden)  # (batch, seq_len, hidden_size)
-
-        # Trim to target length if specified
         if target_len is not None and hidden.shape[1] > target_len:
             hidden = hidden[:, :target_len, :]
 
         # Process through backbone (non-causal for reconstruction)
-        # We use the backbone without causal masking since we're reconstructing
         if not any(p.requires_grad for p in self.backbone.parameters()):
             self.backbone.eval()
 
@@ -225,8 +248,6 @@ class TextDecoder(nn.Module):
             )
 
         hidden = outputs.last_hidden_state  # (batch, seq_len, hidden_size)
-
-        # Project to vocabulary logits
         logits = self.output_head(hidden)  # (batch, seq_len, vocab_size)
 
         return logits

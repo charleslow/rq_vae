@@ -2,8 +2,13 @@
 
 import torch
 import torch.nn as nn
-from unsloth import FastLanguageModel
 from einops import rearrange
+
+try:
+    from unsloth import FastLanguageModel
+    UNSLOTH_AVAILABLE = True
+except (ImportError, NotImplementedError):
+    UNSLOTH_AVAILABLE = False
 
 from .layers import SwiGLUTransformerLayer
 
@@ -53,15 +58,29 @@ class TextEncoder(nn.Module):
         self.compression_factor = compression_factor
         self.num_latent_layers = num_latent_layers
 
-        # Load pretrained Qwen3 with Unsloth optimizations
-        self.backbone, _ = FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=2048,  # adjust based on your max sequence length
-            dtype=torch.bfloat16,
-            load_in_4bit=False,  # set to True for memory efficiency
-        )
-        self.config = self.backbone.config
-        self.hidden_size = self.config.hidden_size
+        # Load pretrained model (use Unsloth if available, otherwise standard transformers)
+        if UNSLOTH_AVAILABLE and torch.cuda.is_available():
+            try:
+                self.backbone, _ = FastLanguageModel.from_pretrained(
+                    model_name=model_name,
+                    max_seq_length=2048,
+                    dtype=torch.bfloat16,
+                    load_in_4bit=False,
+                )
+                self.config = self.backbone.config
+                self.hidden_size = self.config.hidden_size
+            except Exception:
+                # Fallback to standard transformers if Unsloth fails
+                from transformers import AutoModel
+                self.backbone = AutoModel.from_pretrained(model_name)
+                self.config = self.backbone.config
+                self.hidden_size = self.config.hidden_size
+        else:
+            # Use standard transformers on CPU or when Unsloth not available
+            from transformers import AutoModel
+            self.backbone = AutoModel.from_pretrained(model_name)
+            self.config = self.backbone.config
+            self.hidden_size = self.config.hidden_size
 
         # Freeze backbone if specified
         if freeze_backbone:
