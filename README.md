@@ -14,7 +14,16 @@ We use ideas from two papers:
 
 ## Experiment Goal
 
-Two main goals:
-- Verify if we can achieve significant speedup by decoding in latent space without losing accuracy.
-- Verify if the latent representations are useful for e.g. search or recommendation
+Verify if we can achieve significant speedup by decoding in latent space without losing accuracy
+- Check perplexity on held out data
+- Check codebook usage
+- Compare against various base models (including qwen0.6B) on standard LLM tasks
+
+Other goals:
+- Test if RQ-transformer matches standard transformer decoding for the same compute
+- Test if using a pretrained decoder backbone is necessary
+- Test performance - inference speed trade-off as we increase compression factor
+- Test codebook vocabulary size to codebook depth tradeoff
+- Test if unsloth speeds up inference significantly
+
 

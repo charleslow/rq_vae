@@ -166,7 +166,13 @@ class ResidualQuantizer(nn.Module):
         if dead_mask.any():
             # Replace with random vectors from input
             n_dead = dead_mask.sum().item()
-            random_indices = torch.randperm(residual.shape[0], device=residual.device)[:n_dead]
+            n_samples = residual.shape[0]
+            # If we have more dead codes than samples, repeat the indices
+            if n_dead <= n_samples:
+                random_indices = torch.randperm(n_samples, device=residual.device)[:n_dead]
+            else:
+                # Repeat indices to cover all dead codes
+                random_indices = torch.randint(0, n_samples, (n_dead,), device=residual.device)
             self.codebooks.data[level, dead_mask] = residual[random_indices]
             self.ema_cluster_size[level, dead_mask] = 1.0
             self.ema_embed_sum[level, dead_mask] = residual[random_indices]
