@@ -95,6 +95,7 @@ class RQVAE(nn.Module):
                 - indices: Codebook indices (batch, compressed_len, codebook_levels)
                 - commitment_loss: Commitment loss
                 - perplexities: Per-level codebook perplexity (codebook_levels,)
+                - dead_code_replacements: Per-level count of reinitialized codes
         """
         # Encode to continuous latent
         latent = self.encoder(input_ids, attention_mask)
@@ -108,6 +109,7 @@ class RQVAE(nn.Module):
             "indices": quant_out["indices"],
             "commitment_loss": quant_out["commitment_loss"],
             "perplexities": quant_out["perplexities"],
+            "dead_code_replacements": quant_out["dead_code_replacements"],
         }
 
     def decode(
@@ -159,6 +161,7 @@ class RQVAE(nn.Module):
                 - perplexities: Per-level codebook perplexity (codebook_levels,)
                 - indices: Codebook indices
                 - accuracy: Token-level reconstruction accuracy
+                - dead_code_replacements: Per-level count of reinitialized codes
         """
         seq_len = input_ids.shape[1]
 
@@ -195,6 +198,7 @@ class RQVAE(nn.Module):
             "perplexities": enc_out["perplexities"],
             "indices": enc_out["indices"],
             "accuracy": accuracy,
+            "dead_code_replacements": enc_out["dead_code_replacements"],
         }
 
     def get_codebook_usage(self) -> torch.Tensor:

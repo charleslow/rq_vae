@@ -24,8 +24,8 @@ class Quantizer(nn.Module):
         dim: int,
         codebook_size: int = 512,
         ema_decay: float = 0.999,
-        epsilon: float = 1e-5,
-        threshold_ema_dead_code: int = 2,
+        epsilon: float = 1e-8,
+        threshold_ema_dead_code: int = 1,
     ):
         """
         Args:
@@ -87,15 +87,18 @@ class Quantizer(nn.Module):
 
         return quantized, indices
 
-    def update_codebook_ema(self, x: torch.Tensor, indices: torch.Tensor):
+    def update_codebook_ema(self, x: torch.Tensor, indices: torch.Tensor) -> int:
         """Update codebook using exponential moving average.
 
         Args:
             x: Input vectors (n, dim)
             indices: Selected codebook indices (n,)
+
+        Returns:
+            Number of dead codes that were reinitialized
         """
         if not self.training:
-            return
+            return 0
 
         # Count assignments to each code
         one_hot = F.one_hot(indices, self.codebook_size).float()  # (n, codebook_size)
@@ -109,14 +112,12 @@ class Quantizer(nn.Module):
 
         # Laplace smoothing to avoid division by zero
         cluster_size_smoothed = laplace_smoothing(self.ema_cluster_size, self.codebook_size, self.epsilon)
-
-        # Update codebook
         self.codebook.data = self.ema_embed_sum / cluster_size_smoothed.unsqueeze(-1)
 
         # Replace dead codes
         dead_mask = self.ema_cluster_size < self.threshold_ema_dead_code
-        if dead_mask.any():
-            n_dead = dead_mask.sum().item()
+        n_dead = dead_mask.sum().item()
+        if n_dead > 0:
             n_samples = x.shape[0]
             if n_dead <= n_samples:
                 random_indices = torch.randperm(n_samples, device=x.device)[:n_dead]
@@ -125,6 +126,8 @@ class Quantizer(nn.Module):
             self.codebook.data[dead_mask] = x[random_indices]
             self.ema_cluster_size[dead_mask] = 1.0
             self.ema_embed_sum[dead_mask] = x[random_indices]
+
+        return n_dead
 
     def compute_perplexity(self, indices: torch.Tensor) -> torch.Tensor:
         """Compute perplexity (codebook utilization).
@@ -208,6 +211,7 @@ class ResidualQuantizer(nn.Module):
                 - indices: Codebook indices (batch, seq_len, codebook_levels)
                 - commitment_loss: Commitment loss scalar
                 - perplexities: Per-level codebook perplexity (codebook_levels,)
+                - dead_code_replacements: Per-level count of reinitialized codes (codebook_levels,)
         """
         batch, seq_len, dim = x.shape
 
@@ -224,13 +228,15 @@ class ResidualQuantizer(nn.Module):
         all_indices = []
         total_commitment_loss = 0.0
         perplexities = []
+        dead_code_replacements = []
 
         for quantizer in self.quantizers:
             # Quantize current residual
             quantized, indices = quantizer.quantize(residual)
 
-            # Update codebook with EMA
-            quantizer.update_codebook_ema(residual, indices)
+            # Update codebook with EMA and track dead code replacements
+            n_replaced = quantizer.update_codebook_ema(residual, indices)
+            dead_code_replacements.append(n_replaced)
 
             # Commitment loss: encourage encoder output to stay close to codes
             commitment_loss = F.mse_loss(residual, quantized.detach())
@@ -265,6 +271,7 @@ class ResidualQuantizer(nn.Module):
             "indices": indices,
             "commitment_loss": total_commitment_loss * self.commitment_weight,
             "perplexities": torch.stack(perplexities),
+            "dead_code_replacements": dead_code_replacements,
         }
 
     def decode_indices(self, indices: torch.Tensor) -> torch.Tensor:

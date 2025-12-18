@@ -114,6 +114,12 @@ class RQVAELightningModule(L.LightningModule):
             for i, u in enumerate(usage):
                 self.log(f"codebook/usage_level_{i}", u.item())
 
+        # Log dead code replacements
+        dead_replacements = outputs["dead_code_replacements"]
+        for i, n in enumerate(dead_replacements):
+            self.log(f"codebook/dead_replaced_level_{i}", float(n))
+        self.log("codebook/dead_replaced_total", float(sum(dead_replacements)))
+
         return outputs["total_loss"]
 
     def validation_step(self, batch, batch_idx):
