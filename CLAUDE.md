@@ -9,3 +9,5 @@ RQ-VAE (Residual Quantized Variational Autoencoder) experiments for fast text de
 ## Test configuration
 
 Maintain a minimal set of tests that tests only the critical logic of the modules. Aim for readable and essential tests that are easier to maintain rather than exhausting all possibilities.
+
+Before running tests, make sure to `source .venv/bin/activate` before running python scripts.

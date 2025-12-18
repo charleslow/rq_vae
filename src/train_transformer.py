@@ -56,13 +56,16 @@ class RQTransformerLightningModule(L.LightningModule):
         # Compute compressed sequence length
         self.compressed_len = max_length // self.vae_config["compression_factor"]
 
+        # Support both old (num_quantizers) and new (codebook_levels) config keys
+        codebook_levels = self.vae_config.get("codebook_levels") or self.vae_config.get("num_quantizers")
+
         # Create VAE (will be frozen)
         self.vae = RQVAE(
             model_name=self.vae_config["model_name"],
             latent_dim=self.vae_config["latent_dim"],
             compression_factor=self.vae_config["compression_factor"],
             codebook_size=self.vae_config["codebook_size"],
-            num_quantizers=self.vae_config["num_quantizers"],
+            codebook_levels=codebook_levels,
             freeze_backbone=True,
         )
         self.vae.load_state_dict(vae_ckpt["model_state_dict"])
@@ -76,7 +79,7 @@ class RQTransformerLightningModule(L.LightningModule):
         self.transformer = RQTransformer(
             dim=dim,
             codebook_size=self.vae_config["codebook_size"],
-            num_quantizers=self.vae_config["num_quantizers"],
+            codebook_levels=codebook_levels,
             spatial_layers=spatial_layers,
             depth_layers=depth_layers,
             num_heads=num_heads,
@@ -85,6 +88,9 @@ class RQTransformerLightningModule(L.LightningModule):
             max_seq_len=self.compressed_len,
             use_rope=use_rope,
         )
+
+        # Store codebook_levels for later use
+        self.codebook_levels = codebook_levels
 
         # Store config
         self.lr = lr
@@ -202,7 +208,7 @@ class RQTransformerLightningModule(L.LightningModule):
         checkpoint["transformer_config"] = {
             "dim": self.hparams.dim,
             "codebook_size": self.vae_config["codebook_size"],
-            "num_quantizers": self.vae_config["num_quantizers"],
+            "codebook_levels": self.codebook_levels,
             "spatial_layers": self.hparams.spatial_layers,
             "depth_layers": self.hparams.depth_layers,
             "num_heads": self.hparams.num_heads,
@@ -404,7 +410,7 @@ def main():
         "config": {
             "dim": args.dim,
             "codebook_size": model.vae_config["codebook_size"],
-            "num_quantizers": model.vae_config["num_quantizers"],
+            "codebook_levels": model.codebook_levels,
             "spatial_layers": args.spatial_layers,
             "depth_layers": args.depth_layers,
             "num_heads": args.num_heads,

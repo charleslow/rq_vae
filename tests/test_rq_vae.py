@@ -21,7 +21,7 @@ class TestRQVAE:
             latent_dim=128,
             compression_factor=4,
             codebook_size=32,
-            num_quantizers=4,
+            codebook_levels=4,
             hidden_size=256,
             vocab_size=1000,
             freeze_backbone=True,

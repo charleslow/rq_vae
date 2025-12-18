@@ -20,7 +20,7 @@ class TestRQTransformer:
         return RQTransformer(
             dim=128,
             codebook_size=32,
-            num_quantizers=4,
+            codebook_levels=4,
             spatial_layers=2,
             depth_layers=2,
             num_heads=8,

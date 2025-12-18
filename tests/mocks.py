@@ -129,7 +129,7 @@ def create_mock_rqvae(
     latent_dim: int = 128,
     compression_factor: int = 4,
     codebook_size: int = 32,
-    num_quantizers: int = 4,
+    codebook_levels: int = 4,
     hidden_size: int = 256,
     vocab_size: int = 1000,
     freeze_backbone: bool = True,
@@ -151,7 +151,7 @@ def create_mock_rqvae(
                     latent_dim=latent_dim,
                     compression_factor=compression_factor,
                     codebook_size=codebook_size,
-                    num_quantizers=num_quantizers,
+                    codebook_levels=codebook_levels,
                     freeze_backbone=freeze_backbone,
                 )
 

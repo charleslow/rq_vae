@@ -7,7 +7,7 @@ model:
   latent_dim: 512
   compression_factor: 4  # 128 tokens -> 32 latents
   codebook_size: 512
-  num_quantizers: 4  # K^D = 512^4 capacity
+  codebook_levels: 4  # K^D = 512^4 capacity
   commitment_weight: 0.25
 
 # Data config (small subset)

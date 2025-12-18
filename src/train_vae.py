@@ -34,7 +34,7 @@ class RQVAELightningModule(L.LightningModule):
         latent_dim: int = 512,
         compression_factor: int = 4,
         codebook_size: int = 512,
-        num_quantizers: int = 8,
+        codebook_levels: int = 8,
         commitment_weight: float = 0.25,
         lr: float = 1e-4,
         weight_decay: float = 0.01,
@@ -51,7 +51,7 @@ class RQVAELightningModule(L.LightningModule):
             latent_dim=latent_dim,
             compression_factor=compression_factor,
             codebook_size=codebook_size,
-            num_quantizers=num_quantizers,
+            codebook_levels=codebook_levels,
             commitment_weight=commitment_weight,
             freeze_backbone=True,
         )
@@ -101,7 +101,12 @@ class RQVAELightningModule(L.LightningModule):
         self.log("train/reconstruction_loss", outputs["reconstruction_loss"])
         self.log("train/commitment_loss", outputs["commitment_loss"])
         self.log("train/accuracy", outputs["accuracy"], prog_bar=True)
-        self.log("train/perplexity", outputs["perplexity"])
+
+        # Log per-level perplexities
+        perplexities = outputs["perplexities"]
+        for i, ppl in enumerate(perplexities):
+            self.log(f"train/perplexity_level_{i}", ppl.item())
+        self.log("train/perplexity_mean", perplexities.mean().item())
 
         # Log codebook usage periodically
         if batch_idx % 100 == 0:
@@ -120,7 +125,12 @@ class RQVAELightningModule(L.LightningModule):
         self.log("val/loss", outputs["total_loss"], prog_bar=True, sync_dist=True)
         self.log("val/reconstruction_loss", outputs["reconstruction_loss"], sync_dist=True)
         self.log("val/accuracy", outputs["accuracy"], prog_bar=True, sync_dist=True)
-        self.log("val/perplexity", outputs["perplexity"], sync_dist=True)
+
+        # Log per-level perplexities
+        perplexities = outputs["perplexities"]
+        for i, ppl in enumerate(perplexities):
+            self.log(f"val/perplexity_level_{i}", ppl.item(), sync_dist=True)
+        self.log("val/perplexity_mean", perplexities.mean().item(), sync_dist=True)
 
         # Log example reconstructions for first batch
         if batch_idx == 0 and self.tokenizer is not None:
@@ -232,7 +242,7 @@ def parse_args():
     parser.add_argument("--latent-dim", type=int, default=512)
     parser.add_argument("--compression-factor", type=int, default=4)
     parser.add_argument("--codebook-size", type=int, default=512)
-    parser.add_argument("--num-quantizers", type=int, default=8)
+    parser.add_argument("--codebook-levels", type=int, default=8)
     parser.add_argument("--commitment-weight", type=float, default=0.25)
 
     # Data arguments
@@ -294,7 +304,7 @@ def main():
         latent_dim=args.latent_dim,
         compression_factor=args.compression_factor,
         codebook_size=args.codebook_size,
-        num_quantizers=args.num_quantizers,
+        codebook_levels=args.codebook_levels,
         commitment_weight=args.commitment_weight,
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -355,7 +365,7 @@ def main():
             "latent_dim": args.latent_dim,
             "compression_factor": args.compression_factor,
             "codebook_size": args.codebook_size,
-            "num_quantizers": args.num_quantizers,
+            "codebook_levels": args.codebook_levels,
         },
     }, final_path)
     print(f"Saved final model to {final_path}")

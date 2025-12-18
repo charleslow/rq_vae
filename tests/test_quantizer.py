@@ -20,7 +20,7 @@ class TestResidualQuantizer:
         return ResidualQuantizer(
             dim=64,
             codebook_size=32,
-            num_quantizers=4,
+            codebook_levels=4,
             commitment_weight=0.25,
         )
 
@@ -37,7 +37,7 @@ class TestResidualQuantizer:
         assert output["quantized"].shape == (batch, seq_len, dim)
         assert output["indices"].shape == (batch, seq_len, 4)
         assert output["commitment_loss"].dim() == 0
-        assert output["perplexity"].dim() == 0
+        assert output["perplexities"].shape == (4,)  # One perplexity per codebook level
 
     def test_decode_indices(self, quantizer):
         """Test decoding indices back to continuous vectors."""
@@ -75,9 +75,9 @@ class TestResidualQuantizer:
 
         # Eval mode - EMA should not update
         quantizer.eval()
-        ema_before_eval = quantizer.ema_cluster_size.clone()
+        ema_before_eval = torch.stack([q.ema_cluster_size.clone() for q in quantizer.quantizers])
         quantizer(x)
-        ema_after_eval = quantizer.ema_cluster_size
+        ema_after_eval = torch.stack([q.ema_cluster_size for q in quantizer.quantizers])
 
         assert torch.allclose(ema_before_eval, ema_after_eval)
 
@@ -86,7 +86,7 @@ class TestResidualQuantizer:
         """Test that indices are within valid codebook range."""
         device = get_device()
         quantizer = ResidualQuantizer(
-            dim=64, codebook_size=codebook_size, num_quantizers=4
+            dim=64, codebook_size=codebook_size, codebook_levels=4
         ).to(device)
 
         x = torch.randn(2, 16, 64, device=device)

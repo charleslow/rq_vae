@@ -22,7 +22,7 @@ class RQVAE(nn.Module):
         latent_dim: int = 512,
         compression_factor: int = 4,
         codebook_size: int = 512,
-        num_quantizers: int = 8,
+        codebook_levels: int = 8,
         commitment_weight: float = 0.25,
         freeze_backbone: bool = True,
     ):
@@ -32,7 +32,7 @@ class RQVAE(nn.Module):
             latent_dim: Dimension of latent space
             compression_factor: Sequence compression ratio (must be power of 2)
             codebook_size: Number of entries per codebook (K)
-            num_quantizers: Number of residual quantization levels (D)
+            codebook_levels: Number of residual quantization levels (D)
             commitment_weight: Weight for commitment loss
             freeze_backbone: Whether to freeze pretrained backbone initially
         """
@@ -41,7 +41,7 @@ class RQVAE(nn.Module):
         self.latent_dim = latent_dim
         self.compression_factor = compression_factor
         self.codebook_size = codebook_size
-        self.num_quantizers = num_quantizers
+        self.codebook_levels = codebook_levels
 
         # Encoder
         self.encoder = TextEncoder(
@@ -55,7 +55,7 @@ class RQVAE(nn.Module):
         self.quantizer = ResidualQuantizer(
             dim=latent_dim,
             codebook_size=codebook_size,
-            num_quantizers=num_quantizers,
+            codebook_levels=codebook_levels,
             commitment_weight=commitment_weight,
         )
 
@@ -92,9 +92,9 @@ class RQVAE(nn.Module):
             Dictionary containing:
                 - latent: Continuous latent before quantization
                 - quantized: Quantized latent
-                - indices: Codebook indices (batch, compressed_len, num_quantizers)
+                - indices: Codebook indices (batch, compressed_len, codebook_levels)
                 - commitment_loss: Commitment loss
-                - perplexity: Codebook perplexity
+                - perplexities: Per-level codebook perplexity (codebook_levels,)
         """
         # Encode to continuous latent
         latent = self.encoder(input_ids, attention_mask)
@@ -107,7 +107,7 @@ class RQVAE(nn.Module):
             "quantized": quant_out["quantized"],
             "indices": quant_out["indices"],
             "commitment_loss": quant_out["commitment_loss"],
-            "perplexity": quant_out["perplexity"],
+            "perplexities": quant_out["perplexities"],
         }
 
     def decode(
@@ -130,7 +130,7 @@ class RQVAE(nn.Module):
         """Decode codebook indices to continuous representation.
 
         Args:
-            indices: Codebook indices (batch, compressed_len, num_quantizers)
+            indices: Codebook indices (batch, compressed_len, codebook_levels)
 
         Returns:
             Decoded continuous representation (batch, compressed_len, latent_dim)
@@ -156,7 +156,7 @@ class RQVAE(nn.Module):
                 - reconstruction_loss: Cross-entropy reconstruction loss
                 - commitment_loss: Commitment loss from quantizer
                 - total_loss: Combined loss
-                - perplexity: Codebook perplexity
+                - perplexities: Per-level codebook perplexity (codebook_levels,)
                 - indices: Codebook indices
                 - accuracy: Token-level reconstruction accuracy
         """
@@ -192,7 +192,7 @@ class RQVAE(nn.Module):
             "reconstruction_loss": reconstruction_loss,
             "commitment_loss": enc_out["commitment_loss"],
             "total_loss": total_loss,
-            "perplexity": enc_out["perplexity"],
+            "perplexities": enc_out["perplexities"],
             "indices": enc_out["indices"],
             "accuracy": accuracy,
         }
@@ -233,7 +233,7 @@ class RQVAE(nn.Module):
                 "latent_dim": self.latent_dim,
                 "compression_factor": self.compression_factor,
                 "codebook_size": self.codebook_size,
-                "num_quantizers": self.num_quantizers,
+                "codebook_levels": self.codebook_levels,
             },
             "model_state_dict": self.state_dict(),
         }

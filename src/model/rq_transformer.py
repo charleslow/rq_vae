@@ -322,7 +322,7 @@ class SpatialTransformer(nn.Module):
         self,
         dim: int,
         codebook_size: int,
-        num_quantizers: int,
+        codebook_levels: int,
         num_layers: int = 12,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
@@ -334,7 +334,7 @@ class SpatialTransformer(nn.Module):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
-        self.num_quantizers = num_quantizers
+        self.codebook_levels = codebook_levels
         self.use_rope = use_rope
 
         # Embeddings for codebook indices (shared across depth levels)
@@ -371,7 +371,7 @@ class SpatialTransformer(nn.Module):
         """Compute spatial context vectors.
 
         Args:
-            indices: Previous codes (batch, seq_len, num_quantizers) or None for inference
+            indices: Previous codes (batch, seq_len, codebook_levels) or None for inference
             seq_len: Sequence length (required if indices is None)
 
         Returns:
@@ -439,7 +439,7 @@ class DepthTransformer(nn.Module):
         self,
         dim: int,
         codebook_size: int,
-        num_quantizers: int,
+        codebook_levels: int,
         num_layers: int = 4,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
@@ -450,7 +450,7 @@ class DepthTransformer(nn.Module):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
-        self.num_quantizers = num_quantizers
+        self.codebook_levels = codebook_levels
         self.use_rope = use_rope
 
         # Embeddings for codebook indices
@@ -458,7 +458,7 @@ class DepthTransformer(nn.Module):
 
         # Depth positional encoding (learnable) - used for additive encoding
         # Keep learnable embeddings even with RoPE to add to h_t for depth conditioning
-        self.depth_pos_embed = nn.Embedding(num_quantizers, dim)
+        self.depth_pos_embed = nn.Embedding(codebook_levels, dim)
 
         # Transformer layers
         self.layers = nn.ModuleList([
@@ -466,7 +466,7 @@ class DepthTransformer(nn.Module):
                 dim, num_heads, mlp_ratio, dropout,
                 causal=True,
                 use_rope=use_rope,
-                max_seq_len=num_quantizers,  # Depth sequence is at most num_quantizers
+                max_seq_len=codebook_levels,  # Depth sequence is at most codebook_levels
                 rope_base=rope_base,
             )
             for _ in range(num_layers)
@@ -486,11 +486,11 @@ class DepthTransformer(nn.Module):
 
         Args:
             h_t: Spatial context vectors (batch, seq_len, dim) or (batch, dim) for single position
-            indices: Ground truth codes for teacher forcing (batch, seq_len, num_quantizers)
+            indices: Ground truth codes for teacher forcing (batch, seq_len, codebook_levels)
                      or None for autoregressive inference
 
         Returns:
-            Logits over codebook (batch, seq_len, num_quantizers, codebook_size)
+            Logits over codebook (batch, seq_len, codebook_levels, codebook_size)
         """
         # Handle single position case
         if h_t.dim() == 2:
@@ -500,7 +500,7 @@ class DepthTransformer(nn.Module):
             single_pos = False
 
         batch, T, dim = h_t.shape
-        D = self.num_quantizers
+        D = self.codebook_levels
         device = h_t.device
 
         # Get depth positional embeddings
@@ -594,7 +594,7 @@ class RQTransformer(nn.Module):
         self,
         dim: int = 512,
         codebook_size: int = 512,
-        num_quantizers: int = 8,
+        codebook_levels: int = 8,
         spatial_layers: int = 12,
         depth_layers: int = 4,
         num_heads: int = 8,
@@ -608,7 +608,7 @@ class RQTransformer(nn.Module):
         Args:
             dim: Model dimension
             codebook_size: Size of each codebook (K)
-            num_quantizers: Number of RQ depth levels (D)
+            codebook_levels: Number of RQ depth levels (D)
             spatial_layers: Number of layers in spatial transformer
             depth_layers: Number of layers in depth transformer
             num_heads: Number of attention heads
@@ -621,13 +621,13 @@ class RQTransformer(nn.Module):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
-        self.num_quantizers = num_quantizers
+        self.codebook_levels = codebook_levels
         self.use_rope = use_rope
 
         self.spatial_transformer = SpatialTransformer(
             dim=dim,
             codebook_size=codebook_size,
-            num_quantizers=num_quantizers,
+            codebook_levels=codebook_levels,
             num_layers=spatial_layers,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
@@ -640,7 +640,7 @@ class RQTransformer(nn.Module):
         self.depth_transformer = DepthTransformer(
             dim=dim,
             codebook_size=codebook_size,
-            num_quantizers=num_quantizers,
+            codebook_levels=codebook_levels,
             num_layers=depth_layers,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
@@ -656,11 +656,11 @@ class RQTransformer(nn.Module):
         """Forward pass with teacher forcing.
 
         Args:
-            indices: Ground truth codes (batch, seq_len, num_quantizers)
+            indices: Ground truth codes (batch, seq_len, codebook_levels)
 
         Returns:
             Dictionary containing:
-                - logits: Predicted logits (batch, seq_len, num_quantizers, codebook_size)
+                - logits: Predicted logits (batch, seq_len, codebook_levels, codebook_size)
                 - loss: Cross-entropy loss
         """
         batch, T, D = indices.shape
@@ -703,12 +703,12 @@ class RQTransformer(nn.Module):
             device: Device to generate on
 
         Returns:
-            Generated codes (batch, seq_len, num_quantizers)
+            Generated codes (batch, seq_len, codebook_levels)
         """
         if device is None:
             device = next(self.parameters()).device
 
-        D = self.num_quantizers
+        D = self.codebook_levels
         generated = []
 
         # Generate position by position
