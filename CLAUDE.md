@@ -11,3 +11,15 @@ RQ-VAE (Residual Quantized Variational Autoencoder) experiments for fast text de
 Maintain a minimal set of tests that tests only the critical logic of the modules. Aim for readable and essential tests that are easier to maintain rather than exhausting all possibilities.
 
 Before running tests, make sure to `source .venv/bin/activate` before running python scripts.
+
+## Library Usage
+
+Use established implementations when they are available:
+- For residual quantization:
+    - Use `ResidualVQ` from `vector_quantize_pytorch`
+- For optimized pytorch transformer modules:
+    - Use `x_transformers` package
+    - e.g. Use `x_transformers.Decoder` for a standard implementation of the transformer decoder
+- For the RQ-transformer:
+    - Use `src/external/rq_transformer.py`. This is copied from an established source by `lucidrains`, do not modify this file
+

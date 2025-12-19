@@ -40,7 +40,6 @@ class RQTransformerLightningModule(L.LightningModule):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
-        use_rope: bool = False,
         # Training config
         lr: float = 3e-4,
         weight_decay: float = 0.01,
@@ -89,7 +88,6 @@ class RQTransformerLightningModule(L.LightningModule):
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 max_seq_len=self.compressed_len,
-                use_rope=use_rope,
             )
         elif model_type == "flat":
             self.transformer = FlatTransformer(
@@ -101,7 +99,6 @@ class RQTransformerLightningModule(L.LightningModule):
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 max_seq_len=self.compressed_len,
-                use_rope=use_rope,
             )
         else:
             raise ValueError(f"Unknown model_type: {model_type}")

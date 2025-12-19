@@ -166,6 +166,7 @@ class RQVAE(nn.Module):
         )
 
         with torch.no_grad():
+            # Log accuracy metric
             preds = logits.argmax(dim=-1)
             mask = labels != -100
             accuracy = (preds[mask] == labels[mask]).float().mean()
