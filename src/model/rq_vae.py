@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoder import TextEncoder
 from .decoder import TextDecoder
+from .encoder import TextEncoder
 from .quantizer import ResidualQuantizer
 
 
@@ -42,24 +42,18 @@ class RQVAE(nn.Module):
         self.compression_factor = compression_factor
         self.codebook_size = codebook_size
         self.codebook_levels = codebook_levels
-
-        # Encoder
         self.encoder = TextEncoder(
             model_name=model_name,
             latent_dim=latent_dim,
             compression_factor=compression_factor,
             freeze_backbone=freeze_backbone,
         )
-
-        # Residual Quantizer
         self.quantizer = ResidualQuantizer(
             dim=latent_dim,
             codebook_size=codebook_size,
             codebook_levels=codebook_levels,
             commitment_weight=commitment_weight,
         )
-
-        # Decoder
         self.decoder = TextDecoder(
             model_name=model_name,
             latent_dim=latent_dim,
@@ -97,12 +91,8 @@ class RQVAE(nn.Module):
                 - perplexities: Per-level codebook perplexity (codebook_levels,)
                 - dead_code_replacements: Per-level count of reinitialized codes
         """
-        # Encode to continuous latent
         latent = self.encoder(input_ids, attention_mask)
-
-        # Quantize
         quant_out = self.quantizer(latent)
-
         return {
             "latent": latent,
             "quantized": quant_out["quantized"],
@@ -164,14 +154,8 @@ class RQVAE(nn.Module):
                 - dead_code_replacements: Per-level count of reinitialized codes
         """
         seq_len = input_ids.shape[1]
-
-        # Encode and quantize
         enc_out = self.encode(input_ids, attention_mask)
-
-        # Decode
         logits = self.decode(enc_out["quantized"], target_len=seq_len)
-
-        # Compute reconstruction loss
         if labels is None:
             labels = input_ids
 
@@ -181,13 +165,10 @@ class RQVAE(nn.Module):
             ignore_index=-100,  # Ignore padding if present
         )
 
-        # Compute accuracy
         with torch.no_grad():
             preds = logits.argmax(dim=-1)
             mask = labels != -100
             accuracy = (preds[mask] == labels[mask]).float().mean()
-
-        # Total loss
         total_loss = reconstruction_loss + enc_out["commitment_loss"]
 
         return {

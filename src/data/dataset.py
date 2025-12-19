@@ -71,9 +71,17 @@ class TextDataset(Dataset):
             return_tensors="pt",
         )
 
+        input_ids = encoding["input_ids"].squeeze(0)
+        attention_mask = encoding["attention_mask"].squeeze(0)
+
+        # Create labels with -100 for padding positions (ignored in loss)
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+
         return {
-            "input_ids": encoding["input_ids"].squeeze(0),
-            "attention_mask": encoding["attention_mask"].squeeze(0),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
         }
 
 
@@ -128,9 +136,17 @@ class StreamingTextDataset:
                 return_tensors="pt",
             )
 
+            input_ids = encoding["input_ids"].squeeze(0)
+            attention_mask = encoding["attention_mask"].squeeze(0)
+
+            # Create labels with -100 for padding positions (ignored in loss)
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
+
             yield {
-                "input_ids": encoding["input_ids"].squeeze(0),
-                "attention_mask": encoding["attention_mask"].squeeze(0),
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
             }
 
 
@@ -217,15 +233,17 @@ def create_streaming_dataloader(
         text_column=text_column,
     )
 
-    batch = {"input_ids": [], "attention_mask": []}
+    batch = {"input_ids": [], "attention_mask": [], "labels": []}
 
     for example in dataset:
         batch["input_ids"].append(example["input_ids"])
         batch["attention_mask"].append(example["attention_mask"])
+        batch["labels"].append(example["labels"])
 
         if len(batch["input_ids"]) == batch_size:
             yield {
                 "input_ids": torch.stack(batch["input_ids"]),
                 "attention_mask": torch.stack(batch["attention_mask"]),
+                "labels": torch.stack(batch["labels"]),
             }
-            batch = {"input_ids": [], "attention_mask": []}
+            batch = {"input_ids": [], "attention_mask": [], "labels": []}
