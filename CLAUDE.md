@@ -12,11 +12,16 @@ Maintain a minimal set of tests that tests only the critical logic of the module
 
 Before running tests, make sure to `source .venv/bin/activate` before running python scripts.
 
+
+## External Libraries
+
+Some code from external libraries is copied and pasted in `src/external/`. Do NOT modify these files, but can import from them.
+
 ## Library Usage
 
 Use established implementations when they are available:
 - For residual quantization:
-    - Use `ResidualVQ` from `vector_quantize_pytorch`
+    - Use `ResidualVQ` from `src/external/residual_vq.py`
 - For optimized pytorch transformer modules:
     - Use `x_transformers` package
     - e.g. Use `x_transformers.Decoder` for a standard implementation of the transformer decoder
