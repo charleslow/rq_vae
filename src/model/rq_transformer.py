@@ -790,3 +790,66 @@ class RQTransformer(nn.Module):
     def get_num_params(self) -> int:
         """Get total number of parameters."""
         return sum(p.numel() for p in self.parameters())
+
+
+class FlatTransformer(nn.Module):
+    """Standard transformer decoder baseline for ablation.
+
+    Flattens (T, D) codes into T*D sequence. O((T*D)^2) complexity
+    vs O(T^2 + T*D^2) for RQ-Transformer.
+    """
+
+    def __init__(
+        self,
+        dim: int = 512,
+        codebook_size: int = 512,
+        codebook_levels: int = 8,
+        num_layers: int = 12,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        max_seq_len: int = 512,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
+    ):
+        super().__init__()
+        self.codebook_levels = codebook_levels
+        flat_len = max_seq_len * codebook_levels
+
+        self.code_embed = nn.Embedding(codebook_size, dim)
+        self.depth_embed = nn.Embedding(codebook_levels, dim)
+        self.pos_encoding = None if use_rope else SinusoidalPositionalEncoding(dim, flat_len)
+        self.sos_token = nn.Parameter(torch.randn(dim) * 0.02)
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(dim, num_heads, mlp_ratio, dropout, causal=True,
+                             use_rope=use_rope, max_seq_len=flat_len, rope_base=rope_base)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(dim)
+        self.output_head = nn.Linear(dim, codebook_size)
+
+    def forward(self, indices: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch, T, D = indices.shape
+
+        # Flatten and embed
+        flat = rearrange(indices, "b t d -> b (t d)")
+        x = self.code_embed(flat)
+        x = x + self.depth_embed.weight[torch.arange(T * D, device=x.device) % D]
+
+        # Shift right with SOS
+        x = torch.cat([repeat(self.sos_token, "d -> b 1 d", b=batch), x[:, :-1]], dim=1)
+        if self.pos_encoding:
+            x = x + self.pos_encoding(T * D).unsqueeze(0)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        logits = self.output_head(self.final_norm(x))
+        logits = rearrange(logits, "b (t d) c -> b t d c", t=T, d=D)
+
+        loss = F.cross_entropy(rearrange(logits, "b t d c -> (b t d) c"), flat)
+        return {"logits": logits, "loss": loss}
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())

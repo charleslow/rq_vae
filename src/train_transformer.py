@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from data import create_dataloader
-from model import RQVAE, RQTransformer
+from model import RQVAE, RQTransformer, FlatTransformer
 
 
 class RQTransformerLightningModule(L.LightningModule):
@@ -32,7 +32,9 @@ class RQTransformerLightningModule(L.LightningModule):
         # VAE config (loaded from checkpoint)
         vae_checkpoint: str,
         # Transformer config
+        model_type: str = "rq",
         dim: int = 512,
+        num_layers: int = 12,
         spatial_layers: int = 12,
         depth_layers: int = 4,
         num_heads: int = 8,
@@ -75,19 +77,34 @@ class RQTransformerLightningModule(L.LightningModule):
         for param in self.vae.parameters():
             param.requires_grad = False
 
-        # Create transformer
-        self.transformer = RQTransformer(
-            dim=dim,
-            codebook_size=self.vae_config["codebook_size"],
-            codebook_levels=codebook_levels,
-            spatial_layers=spatial_layers,
-            depth_layers=depth_layers,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            max_seq_len=self.compressed_len,
-            use_rope=use_rope,
-        )
+        # Create transformer based on model_type
+        if model_type == "rq":
+            self.transformer = RQTransformer(
+                dim=dim,
+                codebook_size=self.vae_config["codebook_size"],
+                codebook_levels=codebook_levels,
+                spatial_layers=spatial_layers,
+                depth_layers=depth_layers,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                max_seq_len=self.compressed_len,
+                use_rope=use_rope,
+            )
+        elif model_type == "flat":
+            self.transformer = FlatTransformer(
+                dim=dim,
+                codebook_size=self.vae_config["codebook_size"],
+                codebook_levels=codebook_levels,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                max_seq_len=self.compressed_len,
+                use_rope=use_rope,
+            )
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
 
         # Store codebook_levels for later use
         self.codebook_levels = codebook_levels
@@ -206,9 +223,11 @@ class RQTransformerLightningModule(L.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         """Save transformer config in checkpoint."""
         checkpoint["transformer_config"] = {
+            "model_type": self.hparams.model_type,
             "dim": self.hparams.dim,
             "codebook_size": self.vae_config["codebook_size"],
             "codebook_levels": self.codebook_levels,
+            "num_layers": self.hparams.num_layers,
             "spatial_layers": self.hparams.spatial_layers,
             "depth_layers": self.hparams.depth_layers,
             "num_heads": self.hparams.num_heads,
@@ -276,10 +295,13 @@ def parse_args():
     parser.add_argument("--vae-checkpoint", type=str, required=True,
                         help="Path to trained RQ-VAE checkpoint")
 
-    # RQ-Transformer arguments
+    # Transformer arguments
+    parser.add_argument("--model-type", type=str, default="rq", choices=["rq", "flat"],
+                        help="Model type: 'rq' for RQ-Transformer, 'flat' for standard baseline")
     parser.add_argument("--dim", type=int, default=512)
-    parser.add_argument("--spatial-layers", type=int, default=12)
-    parser.add_argument("--depth-layers", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=12, help="Number of layers (flat model)")
+    parser.add_argument("--spatial-layers", type=int, default=12, help="Spatial layers (rq model)")
+    parser.add_argument("--depth-layers", type=int, default=4, help="Depth layers (rq model)")
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -342,7 +364,9 @@ def main():
     # Create model
     model = RQTransformerLightningModule(
         vae_checkpoint=args.vae_checkpoint,
+        model_type=args.model_type,
         dim=args.dim,
+        num_layers=args.num_layers,
         spatial_layers=args.spatial_layers,
         depth_layers=args.depth_layers,
         num_heads=args.num_heads,
@@ -356,7 +380,7 @@ def main():
 
     # Log parameter count
     num_params = model.transformer.get_num_params()
-    print(f"RQ-Transformer parameters: {num_params:,}")
+    print(f"Transformer ({args.model_type}) parameters: {num_params:,}")
 
     # Setup logger
     logger = WandbLogger(
@@ -404,13 +428,15 @@ def main():
     )
 
     # Save final model
-    final_path = os.path.join(args.output_dir, "rq_transformer_final.pt")
+    final_path = os.path.join(args.output_dir, f"{args.model_type}_transformer_final.pt")
     torch.save({
         "model_state_dict": model.transformer.state_dict(),
         "config": {
+            "model_type": args.model_type,
             "dim": args.dim,
             "codebook_size": model.vae_config["codebook_size"],
             "codebook_levels": model.codebook_levels,
+            "num_layers": args.num_layers,
             "spatial_layers": args.spatial_layers,
             "depth_layers": args.depth_layers,
             "num_heads": args.num_heads,

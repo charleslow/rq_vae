@@ -4,11 +4,13 @@
 # RQ-VAE checkpoint (set this to your trained VAE path)
 vae_checkpoint: "./checkpoints/phase1/rq_vae_final.pt"
 
-# RQ-Transformer config
+# Transformer config
 transformer:
+  model_type: rq  # "rq" for RQ-Transformer, "flat" for standard transformer baseline
   dim: 512
-  spatial_layers: 12
-  depth_layers: 4
+  num_layers: 12  # used by flat; rq uses spatial_layers/depth_layers
+  spatial_layers: 12  # rq only
+  depth_layers: 4  # rq only
   num_heads: 8
   mlp_ratio: 4.0
   dropout: 0.1
